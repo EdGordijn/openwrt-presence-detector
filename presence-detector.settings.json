@@ -1,6 +1,9 @@
 {
-  "hass_url": "http://x.x.x.x:8123",
-  "hass_token" : "home-assistant-long-lived access-token",
+  "mqtt_host": "192.x.x.x",
+  "mqtt_port": 1883,
+  "mqtt_username": "<USERNAME>",
+  "mqtt_password": "<PASSWORD>",
+  "mqtt_retain_state": true,
   "interfaces": ["hostapd.phy0-ap0","hostapd.phy1-ap0"],
   "filter_is_denylist": false,
   "filter": ["xx:xx:xx:xx:xx:x1", "xx:xx:xx:xx:xx:x2", "xx:xx:xx:xx:xx:x3"],

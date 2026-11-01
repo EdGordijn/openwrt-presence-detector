@@ -3,123 +3,141 @@
 const fs = require("fs");
 const ubus = require("ubus");
 
-// Interface passed as an argument from the init.d script
+// Interface meegegeven als argument vanuit het init.d script
 let iface = ARGV[0];
 if (!iface) die("Error: No interface specified.\n");
 
-// Read settings
+// Instellingen laden
 let settings = json(fs.readfile("/etc/config/presence-detector.settings.json"));
 
-// Convert keys (MAC addresses) in params to lowercase
+// Keys (MAC adressen) in params naar lowercase omzetten
 let params = {};
 for (let mac in settings.params) params[lc(mac)] = settings.params[mac];
 
-// MAC filter check
+// MAC filter controle
 if (!settings.filter_is_denylist && !length(settings.filter))
     die("Error: No devices specified in filter.\n");
     
 let filter = {};
 for (let mac in settings.filter) filter[lc(mac)] = true;
 
-// Debug
-if (settings.debug) system(sprintf("logger -t presence-detector 'Filter: %J'", filter));
+// Globale status voor geregistreerde clients om dubbele config-berichten te voorkomen
+let registered_clients = {};
 
-// Function to restore connection with Home Assistant
-function handle_connection_failure() {
-    let interval = settings.fallback_sync_interval;
-
-    // Intrval must be greater than 0
-    if (!interval || interval <= 0) {
-        interval = 10;
-        system("logger -t presence-detector 'WARNING: fallback_sync_interval invalid, use 10s as fallback.'");
+// Functie om berichten te publiceren (verbeterd voor zowel strings als JSON)
+function mqtt_publish(topic, payload, retain, is_json) {
+    let auth = "";
+    if (settings.mqtt_username != "") {
+        auth = sprintf("-u '%s' -P '%s' ", settings.mqtt_username, settings.mqtt_password);
     }
+    let retain_flag = retain ? "-r " : "";
     
-    system(sprintf("logger -t presence-detector '(%s) HA offline, start retry loop (interval: %ds).'", iface, interval));
-
-    while (true) {
-        sleep(interval * 1000); 
-        let check_cmd = sprintf("wget -q --spider --header='Authorization: Bearer %s' %s/api/", 
-                                settings.hass_token, settings.hass_url);     
-        if (system(check_cmd) == 0) {
-            system(sprintf("logger -t presence-detector '(%s) HA online, restart service...'", iface));
-            system(sprintf("(sleep 1; /etc/init.d/presence-detector restart) &"));           
-            exit(0); 
-        }
+    // Als het JSON is, zetten we het om naar een string, anders sturen we de rauwe tekst
+    let payload_str = is_json ? sprintf("%J", payload) : payload;
+    
+    // Veilige invoer via stdin pipe om escaping problemen te voorkomen
+    let cmd = sprintf("echo -n '%s' | mosquitto_pub -h '%s' -p %d %s%s-t '%s' -l", 
+                      payload_str, settings.mqtt_host, settings.mqtt_port, auth, retain_flag, topic);
+    
+    if (system(cmd) != 0) {
+        system(sprintf("logger -t presence-detector '(%s) Error: MQTT publish failed to %s'", iface, topic));
+        return false;
     }
+    else {
+        system(sprintf("logger -t presence-detector '(%s) topic: %s, payload: %s'", iface, topic, payload_str));
+    }
+
+    return true;
 }
 
-
-
-// Communication with Home Assistant
+// Communicatie met Home Assistant via MQTT Discovery
 function ha_seen(mac, is_home) {
     let mac_lc = lc(mac);
     
-    // Only process MAC if it passes the filter criteria
+    // Controleer filtercriteria
     if (!settings.filter_is_denylist && !exists(filter, mac_lc)) return;
     if (settings.filter_is_denylist && exists(filter, mac_lc)) return;
 
     let location = is_home ? settings.location : settings.away;
-    let ha_mac = settings.ap_name ? (settings.ap_name + "_" + mac_lc) : mac_lc;
-
-    let payload = {
-        "mac": ha_mac,
-        "location_name": location,
-        "source_type": settings.source_type,
-        "dev_id": ha_mac
-    };
     
-    // Add any additional parameters
-    let device_params = params[mac_lc];
-    for (let key in device_params) payload[key] = device_params[key];
+    // Genereer de unieke device_slug (vervang : door _)
+    let device_name = replace(mac_lc, ":", "_");
+    let device_slug = settings.ap_name ? (settings.ap_name + "_" + device_name) : device_name;
 
-    let cmd = sprintf("wget -q -O - --header='Authorization: Bearer %s' --header='Content-Type: application/json' --post-data='%s' %s/api/services/device_tracker/see", 
-                 settings.hass_token, sprintf("%J", payload), settings.hass_url);
-    
-    if (system(cmd) != 0) {
-        handle_connection_failure();
+    let config_topic = sprintf("homeassistant/device_tracker/%s/config", device_slug);
+    let state_topic = sprintf("homeassistant/device_tracker/%s/state", device_slug);
+
+    // 1. Stuur eenmalig de Discovery Config
+    if (!exists(registered_clients, device_slug)) {
+        let final_name = device_name;
+        
+        if (exists(params, mac_lc) && params[mac_lc].dev_id) {
+            final_name = params[mac_lc].dev_id;
+        }
+
+        let config_payload = {
+            "state_topic": state_topic,
+            "name": final_name,
+            "platform": "device_tracker",
+            "payload_home": settings.location,
+            "payload_not_home": settings.away,
+            "source_type": settings.source_type,
+            "device": { 
+                "connections": [["mac", mac_lc]],
+                "identifiers": [ device_slug ],
+                "name": final_name + "_" + settings.ap_name
+            },
+            "unique_id": device_slug
+        };
+
+        if (mqtt_publish(config_topic, config_payload, false, true)) {
+            registered_clients[device_slug] = true;
+        }
     }
-    else {
-        system(sprintf("logger -t presence-detector '(%s) Event: %s is %s'", iface, mac_lc, location));
-    }
+
+    // 2. Stuur de actuele status als PURE TEKST
+    mqtt_publish(state_topic, location, settings.mqtt_retain_state, false);
 }
 
-
-// Get connected devices on the interface
+// Haal verbonden apparaten op via UBUS
 function ubus_clients(conn, iface, active_clients) {
     let status = conn.call(iface, "get_clients");
     for (let m in status?.clients) {
-        active_clients[lc(m)] = status.clients[m];
+        active_clients[lc(m)] = true; // Sla de mac op als key met waarde true
     }
     return active_clients;
 }
 
-
-// Establish UBUS connection
+// UBUS verbinding opzetten
 let conn = ubus.connect();
 if (!conn) die("Ubus connection failed.\n");
 
-
-// Generate events for all devices after service startup
+// Volledige synchronisatie bij opstarten
 system(sprintf("logger -t presence-detector '(%s) Full sync at startup'", iface));
 let clients = ubus_clients(conn, iface, {}); 
-for (let mac in clients) ha_seen(mac, true);
 
-// Event if the device is not connected to any interface
+// Registreer apparaten die NU verbonden zijn op DEZE interface als HOME
+for (let mac in clients) {
+    ha_seen(mac, true);
+}
+
+// Afwezigheidscontrole: Alleen uitvoeren op de hoofdinterface om interferentie te voorkomen
 if (iface == settings.interfaces[0]) {
-    
-    let clients = {};
-    for (let other_iface in settings.interfaces) {
-        clients = ubus_clients(conn, other_iface, clients); 
+    let all_online_clients = {};
+    for (let i = 0; i < length(settings.interfaces); i++) {
+        all_online_clients = ubus_clients(conn, settings.interfaces[i], all_online_clients); 
     }
 
-    // Check filter devices for allow-list or params devices for deny-list
+    // Controleer welke apparaten uit de params/filter NIET online zijn, en zet ze op afwezig
     let macs_to_check = (settings.filter_is_denylist) ? params : filter;  
     for (let mac in macs_to_check) { 
-        if (!exists(clients, mac)) ha_seen(mac, false);
+        if (!exists(all_online_clients, mac)) {
+            ha_seen(mac, false);
+        }
     }
 }
 
-// The watcher: events on assoc or disassoc
+// De watcher: luisteren naar live assoc en disassoc events
 let p = fs.popen(sprintf("ubus subscribe %s", iface), "r");
 if (p) {
     system(sprintf("logger -t presence-detector 'Watcher gestart voor %s'", iface));
